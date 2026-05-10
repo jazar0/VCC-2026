@@ -69,9 +69,10 @@ def split_list(items: list, ratios: dict[str, float], seed: int) -> dict[str, li
  
  
 def copy_files(files: list[Path], src_root: Path, dst_root: Path, rel_dir: Path) -> int:
-    """Copy *files* into dst_root / rel_dir, creating dirs as needed."""
+    """Copy *files* into dst_root / rel_dir, creating dirs only when needed."""
     target_dir = dst_root / rel_dir
-    target_dir.mkdir(parents=True, exist_ok=True)
+    if not target_dir.exists():
+        target_dir.mkdir(parents=True)
     for f in files:
         shutil.copy2(f, target_dir / f.name)
     return len(files)
