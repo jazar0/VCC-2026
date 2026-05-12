@@ -1,206 +1,362 @@
+"""
+EfficientNetV2-S Street Sign Classification - Single Training Script
+Prompts for training strategy, trains model, saves it.
+"""
+
 import json
+import os
+from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-from tensorflow.keras.applications import EfficientNetV2B2, EfficientNetV2S, ResNet50V2
-from tensorflow.keras.applications.efficientnet_v2 import preprocess_input
 
-# ============================================================
-# CONFIG
-# ============================================================
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
-DATASET_PATH = "split_output"
+DATA_ROOT = "Dataset_split"
+MODELS_DIR = "models"
+CLASS_NAMES_FILE = "class_names.json"
 
-IMG_SIZE = 384
-BATCH_SIZE = 16      # reduced from 32 — 384px images use ~4x more VRAM per batch
-EPOCHS_FROZEN = 30       # Phase 1: early stopping will cut this short if needed
-EPOCHS_FINETUNE = 20     # Phase 2: same
-FINETUNE_LR = 1e-5       # Much lower LR for fine-tuning
-UNFREEZE_LAYERS = 30     # How many top EfficientNet layers to unfreeze
+INPUT_SIZE = 384
+BATCH_SIZE = 256
+EPOCHS = 150
+EARLY_STOPPING_PATIENCE = 8
 
-# ============================================================
-# LOAD DATASETS
-# ============================================================
+# Augmentation ranges (color only, no flips/rotations)
+BRIGHTNESS_RANGE = 0.15
+SATURATION_RANGE = 0.20
+CONTRAST_RANGE = 0.15
 
-train_dataset = tf.keras.utils.image_dataset_from_directory(
-    Path(DATASET_PATH) / "train",
-    image_size=(IMG_SIZE, IMG_SIZE),
-    batch_size=BATCH_SIZE,
-    shuffle=True
-)
+os.makedirs(MODELS_DIR, exist_ok=True)
 
-val_dataset = tf.keras.utils.image_dataset_from_directory(
-    Path(DATASET_PATH) / "val",
-    image_size=(IMG_SIZE, IMG_SIZE),
-    batch_size=BATCH_SIZE,
-    shuffle=False
-)
 
-test_dataset = tf.keras.utils.image_dataset_from_directory(
-    Path(DATASET_PATH) / "test",
-    image_size=(IMG_SIZE, IMG_SIZE),
-    batch_size=BATCH_SIZE,
-    shuffle=False
-)
+# ============================================================================
+# DATA LOADING & AUGMENTATION
+# ============================================================================
 
-class_names = train_dataset.class_names
-num_classes = len(class_names)
+def load_class_names():
+    """Load class names from JSON."""
+    with open(CLASS_NAMES_FILE, "r") as f:
+        return sorted(json.load(f))
 
-print("\nClasses:")
-for i, name in enumerate(class_names):
-    print(f"{i}: {name}")
 
-# ============================================================
-# PERFORMANCE SETTINGS
-# ============================================================
+def augment_image(image):
+    """Apply color augmentation (brightness, saturation, contrast)."""
+    image = tf.image.adjust_brightness(image, tf.random.uniform([], -BRIGHTNESS_RANGE, BRIGHTNESS_RANGE))
+    image = tf.image.adjust_saturation(image, tf.random.uniform([], 1 - SATURATION_RANGE, 1 + SATURATION_RANGE))
+    image = tf.image.adjust_contrast(image, tf.random.uniform([], 1 - CONTRAST_RANGE, 1 + CONTRAST_RANGE))
+    return tf.clip_by_value(image, 0.0, 1.0)
 
-AUTOTUNE = tf.data.AUTOTUNE
 
-train_dataset = train_dataset.prefetch(AUTOTUNE)
-val_dataset   = val_dataset.prefetch(AUTOTUNE)
-test_dataset  = test_dataset.prefetch(AUTOTUNE)
+def load_and_preprocess_image(path, label, augment=False):
+    """Load, resize, normalize, and optionally augment image."""
+    image = tf.io.read_file(path)
+    image = tf.image.decode_jpeg(image, channels=3)
+    image = tf.image.resize(image, [INPUT_SIZE, INPUT_SIZE])
+    image = image / 255.0
+    
+    if augment:
+        image = augment_image(image)
+    
+    return image, label
 
-# ============================================================
-# DATA AUGMENTATION
-# ============================================================
-# NOTE: RandomFlip("horizontal") is intentionally excluded.
-# Many classes are mirror-image pairs (Left/Right Turn, One Way Left/Right,
-# Left/Right Curve, etc). Flipping a "Left Turn Only" sign produces an image
-# indistinguishable from "Right Turn Only" — but the label doesn't change.
-# This was actively teaching the model to confuse left vs right variants.
 
-data_augmentation = keras.Sequential([
-    layers.RandomRotation(0.2),             
-    layers.RandomZoom(0.2),
-    layers.RandomTranslation(0.1, 0.1),      # sign not always centered in frame
-    layers.RandomBrightness(0.3),            # simulate lighting changes
-    layers.RandomContrast(0.3),              # simulate shadows and glare
-], name="data_augmentation")
-
-# ============================================================
-# MODEL
-# ============================================================
-
-base_model = ResNet50V2(
-    include_top=False,
-    weights="imagenet",
-    input_shape=(IMG_SIZE, IMG_SIZE, 3)
-)
-
-base_model.trainable = False   # frozen for Phase 1
-
-inputs = keras.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
-x = data_augmentation(inputs)
-x = preprocess_input(x)
-x = base_model(x, training=False)
-x = layers.GlobalAveragePooling2D()(x)
-x = layers.Dropout(0.2)(x)
-outputs = layers.Dense(num_classes, activation="softmax")(x)
-
-model = keras.Model(inputs, outputs)
-
-# ============================================================
-# PHASE 1 — TRAIN WITH FROZEN BACKBONE
-# ============================================================
-
-model.compile(
-    optimizer="adam",
-    loss="sparse_categorical_crossentropy",
-    metrics=["accuracy"]
-)
-
-model.summary()
-
-# Uniform class weights — forces equal penalty for mistakes on every class
-# regardless of how many images each class has in each batch.
-class_weight = {i: 1.0 for i in range(num_classes)}
-
-# ============================================================
-# CALLBACKS
-# ============================================================
-# EarlyStopping: stops training when val_loss hasn't improved for
-# PATIENCE epochs, then restores the best weights seen so far.
-# With only 25 images/class this is important — the model can
-# memorise the training set quickly and val loss starts climbing.
-#
-# ModelCheckpoint: also saves the best weights to disk mid-training
-# as a safety net in case of a crash.
-
-def make_callbacks(checkpoint_path, patience=7):
-    early_stop = keras.callbacks.EarlyStopping(
-        monitor="val_loss",
-        patience=patience,
-        restore_best_weights=True,  # rolls back to best epoch automatically
-        verbose=1
+def create_dataset(directory, class_names, batch_size, augment=False):
+    """Create tf.data.Dataset from directory."""
+    image_paths = []
+    labels = []
+    
+    for class_idx, class_name in enumerate(class_names):
+        class_dir = os.path.join(directory, class_name)
+        if not os.path.exists(class_dir):
+            continue
+        
+        for image_file in sorted(os.listdir(class_dir)):
+            if image_file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                image_paths.append(os.path.join(class_dir, image_file))
+                labels.append(class_idx)
+    
+    print(f"  Loaded {len(image_paths)} images from {directory}")
+    
+    dataset = tf.data.Dataset.from_tensor_slices((image_paths, labels))
+    
+    if augment:
+        dataset = dataset.shuffle(buffer_size=min(1000, len(image_paths)))
+    
+    dataset = dataset.map(
+        lambda path, label: load_and_preprocess_image(path, label, augment=augment),
+        num_parallel_calls=tf.data.AUTOTUNE,
     )
-    checkpoint = keras.callbacks.ModelCheckpoint(
-        checkpoint_path,
-        monitor="val_loss",
-        save_best_only=True,
-        verbose=1
+    
+    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+
+# ============================================================================
+# MODEL BUILDING
+# ============================================================================
+
+def build_model(class_names, strategy="freeze_early"):
+    """Build EfficientNetV2-S model with specified strategy."""
+    
+    # Load pretrained base
+    base_model = keras.applications.EfficientNetV2S(
+        include_top=False,
+        weights="imagenet",
+        input_shape=(INPUT_SIZE, INPUT_SIZE, 3),
     )
-    return [early_stop, checkpoint]
+    
+    # Apply strategy
+    if strategy == "full":
+        print("  Strategy: FULL FINE-TUNING (all layers trainable)")
+        base_model.trainable = True
+        learning_rate = 1e-4
+    elif strategy == "progressive":
+        print("  Strategy: PROGRESSIVE UNFREEZING (start frozen, unfreeze gradually)")
+        base_model.trainable = False
+        learning_rate = 1e-3
+    else:  # freeze_early
+        print("  Strategy: FREEZE EARLY LAYERS (307 frozen, 206 trainable)")
+        freeze_until = int(len(base_model.layers) * 0.6)
+        for layer in base_model.layers[:freeze_until]:
+            layer.trainable = False
+        for layer in base_model.layers[freeze_until:]:
+            layer.trainable = True
+        learning_rate = 1e-3
+    
+    # Build custom head
+    inputs = keras.Input(shape=(INPUT_SIZE, INPUT_SIZE, 3))
+    x = base_model(inputs, training=(strategy == "full"))
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(512, activation="relu")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.5)(x)
+    x = layers.Dense(256, activation="relu")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.3)(x)
+    outputs = layers.Dense(len(class_names), activation="softmax")(x)
+    
+    model = keras.Model(inputs, outputs, name=f"efficientnetv2_s_{strategy}")
+    
+    # Compile
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+    
+    return model, learning_rate
 
-# ============================================================
-# PHASE 1 — TRAIN WITH FROZEN BACKBONE
-# ============================================================
 
-print("\n=== Phase 1: Training with frozen backbone ===")
-history_phase1 = model.fit(
-    train_dataset,
-    validation_data=val_dataset,
-    epochs=EPOCHS_FROZEN,
-    class_weight=class_weight,
-    callbacks=make_callbacks("best_phase1.keras", patience=10)
-)
+# ============================================================================
+# TRAINING
+# ============================================================================
 
-# ============================================================
-# PHASE 2 — FINE-TUNE TOP LAYERS OF BACKBONE
-# ============================================================
-# Unfreeze the top N layers of EfficientNet and train at a much
-# lower learning rate so we adapt the backbone to our domain
-# without destroying the ImageNet weights.
+class ProgressiveUnfreezeCallback(keras.callbacks.Callback):
+    """Progressively unfreeze layers during training."""
+    
+    def __init__(self, base_model, unfreeze_interval=10):
+        super().__init__()
+        self.base_model = base_model
+        self.unfreeze_interval = unfreeze_interval
+        self.total_layers = len(base_model.layers)
+        self.last_unfreeze_epoch = 0
+    
+    def on_epoch_end(self, epoch, logs=None):
+        if (epoch - self.last_unfreeze_epoch) >= self.unfreeze_interval and epoch > 0:
+            blocks_to_unfreeze = (epoch // self.unfreeze_interval)
+            layers_to_keep_frozen = max(20, self.total_layers - (blocks_to_unfreeze * 15))
+            
+            for layer in self.base_model.layers[:layers_to_keep_frozen]:
+                layer.trainable = False
+            for layer in self.base_model.layers[layers_to_keep_frozen:]:
+                layer.trainable = True
+            
+            trainable_count = sum(1 for l in self.base_model.layers if l.trainable)
+            frozen_count = sum(1 for l in self.base_model.layers if not l.trainable)
+            
+            print(f"\n  📍 Epoch {epoch}: Unfreezing layers | Frozen: {frozen_count}, Trainable: {trainable_count}")
+            
+            current_lr = float(self.model.optimizer.learning_rate)
+            new_lr = current_lr * 0.9
+            self.model.optimizer.learning_rate = new_lr
+            print(f"    Reduced LR to: {new_lr:.2e}\n")
+            
+            self.last_unfreeze_epoch = epoch
 
-print(f"\n=== Phase 2: Fine-tuning top {UNFREEZE_LAYERS} backbone layers ===")
 
-base_model.trainable = True
-for layer in base_model.layers[:-UNFREEZE_LAYERS]:
-    layer.trainable = False
+def train_model(strategy="freeze_early"):
+    """Train model with specified strategy."""
+    
+    print("\n" + "="*70)
+    print(f"TRAINING: EfficientNetV2-S Street Sign Classification")
+    print("="*70)
+    
+    # Load class names
+    class_names = load_class_names()
+    print(f"\nLoading {len(class_names)} classes...")
+    
+    # Determine batch size based on strategy
+    # Full fine-tuning with all trainable layers requires less memory per sample
+    if strategy == "full":
+        batch_size = 64
+        num_epochs = 100
+    else:
+        batch_size = BATCH_SIZE
+        num_epochs = EPOCHS
+    
+    # Load datasets
+    print("\nLoading datasets:")
+    train_ds = create_dataset(os.path.join(DATA_ROOT, "train"), class_names, batch_size, augment=True)
+    val_ds = create_dataset(os.path.join(DATA_ROOT, "val"), class_names, batch_size, augment=False)
+    test_ds = create_dataset(os.path.join(DATA_ROOT, "test"), class_names, batch_size, augment=False)
+    
+    # Build model
+    print("\nBuilding model:")
+    model, learning_rate = build_model(class_names, strategy)
+    print(f"  Learning rate: {learning_rate:.2e}")
+    print(f"  Trainable params: {model.count_params():,}")
+    
+    # Create callbacks
+    callbacks = [
+        # Monitor val_loss: more sensitive than val_accuracy (catches overfitting
+        # earlier since loss degrades before accuracy visibly plateaus).
+        # min_delta=1e-4 prevents noise-level "improvements" from resetting the counter.
+        keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            patience=EARLY_STOPPING_PATIENCE,
+            min_delta=1e-4,
+            mode="min",
+            restore_best_weights=True,
+            verbose=1,
+        ),
+        # Checkpoint on val_loss for consistency with early stopping.
+        keras.callbacks.ModelCheckpoint(
+            os.path.join(MODELS_DIR, f"efficientnetv2_s_{strategy}_best.keras"),
+            monitor="val_loss",
+            save_best_only=True,
+            mode="min",
+            verbose=0,
+        ),
+        # Match monitor to val_loss; tighten patience so LR drops before
+        # early stopping fires, giving the model one real chance to recover.
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.5,
+            patience=4,
+            min_delta=1e-4,
+            mode="min",
+            min_lr=1e-6,
+            verbose=1,
+        ),
+    ]
+    
+    # Add progressive unfreezing callback if needed
+    if strategy == "progressive":
+        callbacks.append(ProgressiveUnfreezeCallback(model.layers[2].layers[0], unfreeze_interval=10))
+    
+    # Train
+    print(f"\n{'='*70}")
+    print(f"Starting training: {strategy.upper()}")
+    print(f"  Epochs: {num_epochs}")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Early stopping patience: {EARLY_STOPPING_PATIENCE}")
+    print(f"{'='*70}\n")
+    
+    history = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=num_epochs,
+        callbacks=callbacks,
+        verbose=1,
+    )
+    
+    # Evaluate on test set
+    print(f"\n{'='*70}")
+    print("EVALUATING ON TEST SET")
+    print(f"{'='*70}")
+    test_loss, test_accuracy = model.evaluate(test_ds, verbose=0)
+    print(f"Test Loss: {test_loss:.4f}")
+    print(f"Test Accuracy: {test_accuracy:.4f}")
+    
+    # Save model
+    model_path = os.path.join(MODELS_DIR, f"efficientnetv2_s_{strategy}_final.keras")
+    model.save(model_path)
+    print(f"\n✓ Model saved: {model_path}")
+    
+    # Save metadata
+    metadata = {
+        "model_name": f"EfficientNetV2-S ({strategy})",
+        "timestamp": datetime.now().isoformat(),
+        "strategy": strategy,
+        "test_accuracy": float(test_accuracy),
+        "test_loss": float(test_loss),
+        "class_names": class_names,
+    }
+    metadata_path = os.path.join(MODELS_DIR, f"efficientnetv2_s_{strategy}_metadata.json")
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"✓ Metadata saved: {metadata_path}")
+    
+    return test_accuracy
 
-trainable_count = sum(1 for l in base_model.layers if l.trainable)
-print(f"Trainable backbone layers: {trainable_count} / {len(base_model.layers)}")
 
-model.compile(
-    optimizer=keras.optimizers.Adam(FINETUNE_LR),
-    loss="sparse_categorical_crossentropy",
-    metrics=["accuracy"]
-)
+# ============================================================================
+# MAIN
+# ============================================================================
 
-# Lower patience for fine-tuning — changes are smaller so overfitting
-# tends to creep in more gradually; 5 epochs is enough to detect it.
-history_phase2 = model.fit(
-    train_dataset,
-    validation_data=val_dataset,
-    epochs=EPOCHS_FINETUNE,
-    class_weight=class_weight,
-    callbacks=make_callbacks("best_phase2.keras", patience=7)
-)
+def main():
+    print("\n" + "="*70)
+    print("EfficientNetV2-S Street Sign Classification Training")
+    print("="*70)
+    print("\nChoose training strategy:\n")
+    print("  1) FREEZE EARLY LAYERS (Fast, ~45 min - 1 hour)")
+    print("     - Freeze ~60% of early layers, train later layers + head")
+    print("     - Good accuracy, fastest training")
+    print("     - Learning rate: 1e-3")
+    print()
+    print("  2) PROGRESSIVE UNFREEZING (Balanced, ~1.5-2 hours)")
+    print("     - Start with frozen backbone, train head, unfreeze every 10 epochs")
+    print("     - Very high accuracy, good balance")
+    print("     - Learning rate: 1e-3 (reduces as layers unfreeze)")
+    print()
+    print("  3) FULL FINE-TUNING (Best accuracy, ~2-3 hours)")
+    print("     - All layers trainable with conservative learning rate")
+    print("     - Highest accuracy, slowest training")
+    print("     - Learning rate: 1e-4")
+    print()
+    
+    choice = input("Enter choice (1/2/3): ").strip()
+    
+    strategies = {
+        "1": "freeze_early",
+        "2": "progressive",
+        "3": "full",
+    }
+    
+    if choice not in strategies:
+        print("Invalid choice. Using strategy 2 (progressive).")
+        strategy = "progressive"
+    else:
+        strategy = strategies[choice]
+    
+    # Enable mixed precision
+    policy = keras.mixed_precision.Policy('mixed_float16')
+    keras.mixed_precision.set_global_policy(policy)
+    print(f"\n✓ Mixed precision enabled: {policy.name}\n")
+    
+    # Train
+    accuracy = train_model(strategy)
+    
+    print(f"\n{'='*70}")
+    print(f"Training Complete!")
+    print(f"Final Test Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
+    print(f"Model saved to: {MODELS_DIR}/efficientnetv2_s_{strategy}_final.keras")
+    print(f"{'='*70}\n")
 
-# ============================================================
-# EVALUATE
-# ============================================================
 
-test_loss, test_accuracy = model.evaluate(test_dataset)
-print(f"\nTest Accuracy: {test_accuracy:.4f}")
-
-# ============================================================
-# SAVE
-# ============================================================
-
-model.save("resnet50v2_classifier.keras")
-print("\nModel saved as resnet50v2_classifier.keras")
-
-with open("class_names.json", "w") as f:
-    json.dump(class_names, f)
+if __name__ == "__main__":
+    main()

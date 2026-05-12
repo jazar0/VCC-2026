@@ -209,18 +209,16 @@ def ensure_class_dir(class_name):
 # ──────────────────────────────────────────────────────────────
 
 def do_zoom(img):
-    """Distance variations & image size variations"""
+    """Distance variations - only zoom out to keep full image visible"""
     w, h = img.size
-    f = random.uniform(0.5, 1.8)
+    f = random.uniform(0.3, 0.75)  # zoom out: 30%–75% of original size
     nw, nh = int(w*f), int(h*f)
-    img = img.resize((nw, nh), Image.LANCZOS)
-    if f > 1:
-        img = img.crop(((nw-w)//2, (nh-h)//2, (nw-w)//2+w, (nh-h)//2+h))
-    else:
-        out = Image.new(img.mode, (w, h), (255, 255, 255))
-        out.paste(img, ((w-nw)//2, (h-nh)//2))
-        img = out
-    return img, f"zoom {'in' if f>1 else 'out'} x{f:.2f}"
+    resized = img.resize((nw, nh), Image.LANCZOS)
+    out = Image.new(img.mode, (w, h), (255, 255, 255))
+    x = random.randint(0, w - nw)
+    y = random.randint(0, h - nh)
+    out.paste(resized, (x, y))
+    return out, f"zoom out x{f:.2f} at ({x},{y})"
 
 def do_rotation(img):
     """Rotation - keep moderate"""
@@ -237,29 +235,27 @@ def do_shear(img):
     return img, f"shear {s:+.2f}"
 
 def do_scale(img):
-    """Scaling with independent x/y - image size variations"""
-    sx, sy = random.uniform(0.6, 1.5), random.uniform(0.6, 1.5)
+    """Scaling with independent x/y - no enlargement, random positioning"""
+    sx, sy = random.uniform(0.35, 0.75), random.uniform(0.35, 0.75)
     w, h = img.size
     nw, nh = int(w*sx), int(h*sy)
     resized = img.resize((nw, nh), Image.LANCZOS)
     out = Image.new(img.mode, (w, h), (255, 255, 255))
-    ox, oy = max(0, (w-nw)//2), max(0, (h-nh)//2)
-    cw, ch = min(nw, w), min(nh, h)
-    cx0, cy0 = max(0, (nw-w)//2), max(0, (nh-h)//2)
-    out.paste(resized.crop((cx0, cy0, cx0+cw, cy0+ch)), (ox, oy))
-    return out, f"scale sx={sx:.2f} sy={sy:.2f}"
+    x = random.randint(0, w - nw)
+    y = random.randint(0, h - nh)
+    out.paste(resized, (x, y))
+    return out, f"scale sx={sx:.2f} sy={sy:.2f} at ({x},{y})"
 
 def do_aspect_ratio(img):
-    """Direct aspect ratio change"""
+    """Direct aspect ratio change - no enlargement, random vertical positioning"""
     w, h = img.size
-    ar = random.uniform(0.6, 1.6)
-    new_w = int(w)
+    ar = random.uniform(1.0, 1.6)  # only taller aspect ratios
     new_h = int(h / ar)
-    resized = img.resize((new_w, new_h), Image.LANCZOS)
+    resized = img.resize((w, new_h), Image.LANCZOS)
     out = Image.new(img.mode, (w, h), (255, 255, 255))
-    y_offset = max(0, (h - new_h) // 2)
-    out.paste(resized, (0, y_offset))
-    return out, f"aspect ratio x{ar:.2f}"
+    y = random.randint(0, h - new_h)
+    out.paste(resized, (0, y))
+    return out, f"aspect ratio x{ar:.2f} at y={y}"
 
 def do_noise(img):
     """Artificial noise - increased"""
@@ -313,10 +309,10 @@ def do_blur(img):
 def random_augmentations(pil_img):
     """Rich augmentation pool with all transformations"""
     pool = [
-        (do_zoom,           0.70),
+        (do_zoom,           0.80),
         (do_rotation,       0.55),
         (do_shear,          0.65),
-        (do_scale,          0.70),
+        (do_scale,          0.75),
         (do_aspect_ratio,   0.60),
         (do_noise,          0.65),
         (do_occlusion,      0.40),
@@ -382,7 +378,9 @@ def pil_to_rgb_bytes(img, tw, th):
 
     return img.tobytes(), tw, th
 
-def viewer_process(shm_name, vw, vh, stop_event):
+def viewer_process(shm_name, vw, vh, stop_event, mon_x=0, mon_y=0):
+
+    os.environ["SDL_VIDEO_WINDOW_POS"] = f"{mon_x},{mon_y}"
 
     pygame.init()
 
@@ -509,7 +507,7 @@ def main():
     else:
         view_mon = monitors[1]
 
-    _, _, VW, VH = view_mon
+    VX, VY, VW, VH = view_mon
 
     shm_size = SHM_HEADER + VW * VH * 3 + 1024
 
@@ -524,7 +522,7 @@ def main():
 
     viewer = mp.Process(
         target=viewer_process,
-        args=(shm.name, VW, VH, stop_event),
+        args=(shm.name, VW, VH, stop_event, VX, VY),
         daemon=True
     )
 
@@ -572,7 +570,8 @@ def main():
                         continue
 
                     capture_count[cls] += 1
-                    filename = f"{cls}_{capture_count[cls]:06d}.jpg"
+                    ts = time.strftime("%Y%m%d_%H%M%S")
+                    filename = f"{cls}_{capture_count[cls]:06d}_{ts}.jpg"
 
                     cv2.imwrite(
                         os.path.join(out_dir, filename),
@@ -600,6 +599,19 @@ def main():
                     time.sleep(args.interval)
 
             print(f"\n[INFO] Completed loop {loop_num} - restarting collection cycle...")
+            # Beep sound using pygame
+            try:
+                pygame.mixer.init()
+                sample_rate = 22050
+                duration = 0.5
+                freq = 1000
+                frames = int(sample_rate * duration)
+                arr = np.sin(2.0 * np.pi * freq * np.linspace(0, duration, frames)).astype(np.float32)
+                sound = pygame.sndarray.make_sound((arr * 32767).astype(np.int16))
+                sound.play()
+                time.sleep(duration)
+            except Exception as e:
+                print(f"[WARN] Beep failed: {e}")
 
     except KeyboardInterrupt:
         print("\n\n[INFO] Collection stopped by user (Ctrl+C)")
