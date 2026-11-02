@@ -324,9 +324,8 @@ def viewer_process(shm_name, vw, vh, stop_event):
         mx, my, _, _ = monitors[1]
         os.environ["SDL_VIDEO_WINDOW_POS"] = f"{mx},{my}"
 
-    screen = pygame.display.set_mode((vw, vh), pygame.NOFRAME)
-    pygame.display.set_caption("Inference Test - Reference")
-
+    screen = pygame.display.set_mode((vw, vh), pygame.FULLSCREEN | pygame.NOFRAME)
+    
     shm = shared_memory.SharedMemory(name=shm_name)
     clock = pygame.time.Clock()
     current = None
@@ -568,7 +567,9 @@ def main():
 
     # ── Camera window with zoom slider ───────────────────────────────────────
     WIN = f"Inference Test - {model_name}"
-    cv2.namedWindow(WIN)
+
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(WIN, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     cv2.createTrackbar("Zoom %", WIN, 0, 100, lambda _: None)
 
     # ── State ────────────────────────────────────────────────────────────────

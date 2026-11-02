@@ -3,8 +3,18 @@ EfficientNetV2-S Street Sign Classification - Single Training Script
 Prompts for training strategy, trains model, saves it.
 """
 
-import json
+# ============================================================================
+# GPU / XLA FIXES — must be set before any TF/CUDA initialization
+# Fix 1: Disable XLA command buffer accumulation (causes OOM on CC 12.0 GPUs
+#         when 400+ graphs pile up across epochs).
+# Fix 2: Cap XLA client memory fraction to leave headroom for graph metadata.
+# These are no-ops on GPUs where the issue doesn't apply.
+# ============================================================================
 import os
+os.environ["XLA_FLAGS"] = "--xla_gpu_enable_command_buffer="
+os.environ["XLA_CLIENT_MEM_FRACTION"] = "0.75"
+
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -199,10 +209,11 @@ def train_model(strategy="freeze_early"):
     class_names = load_class_names()
     print(f"\nLoading {len(class_names)} classes...")
     
-    # Determine batch size based on strategy
-    # Full fine-tuning with all trainable layers requires less memory per sample
+    # Determine batch size based on strategy.
+    # Full fine-tuning: reduced to 32 (from 64) to lower peak VRAM usage at
+    # 384×384 input; this also reduces the number of XLA graph retraces.
     if strategy == "full":
-        batch_size = 64
+        batch_size = 32
         num_epochs = 100
     else:
         batch_size = BATCH_SIZE

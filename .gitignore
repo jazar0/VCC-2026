@@ -5,3 +5,16 @@ Training-Utilities/models
 Final-Models
 
 *.keras
+
+Camera_Collected/
+Camera_Collected.zip
+Data-Collection-Utilities/Augmented_Dataset_Total/
+Data-Collection-Utilities/Augmented_Dataset_Total.zip
+Data-Collection-Utilities/Collected-Data/
+Training-Utilities/Dataset_Before_Narrowing/
+Training-Utilities/Merged_Dataset_Backup/
+Train-New-Test/Dataset_split/
+Train-New-Test/models/
+__pycache__/
+*.pyc
+Inference-Utilities/street_sign_*.jpg
